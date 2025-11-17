@@ -1,152 +1,29 @@
 import pandas as pd
 import numpy as np
-import re
 
-# --------------------------------------------------------
-# Load data
-# --------------------------------------------------------
-pairs = pd.read_csv("supplementary-data/pairs.csv")
-clinical = pd.read_csv("supplementary-data/clinical_metadata.csv")
 
-# --------------------------------------------------------
-# 1. Extract all unique tumor barcodes
-# --------------------------------------------------------
-all_tumor = pd.concat([
-    pairs["tumor_barcode_a"],
-    pairs["tumor_barcode_b"]
-], ignore_index=True).dropna()
-
-all_tumor = all_tumor.unique()
-
-# --------------------------------------------------------
-# 2. Convert tumor_barcode → sample_barcode
-# --------------------------------------------------------
-def tumor_to_sample(tumor):
-    parts = tumor.split("-")
-    return "-".join(parts[:4])  # KEEP FIRST 4 PARTS ONLY
-
-sample_barcodes = list({tumor_to_sample(t) for t in all_tumor})
-
-# --------------------------------------------------------
-# 3. Inner join to clinical metadata → metadata for paired samples
-# --------------------------------------------------------
-paired_metadata = clinical[clinical["sample_barcode"].isin(sample_barcodes)].copy()
-
-# --------------------------------------------------------
-# 4. Extract the non-paired sample metadata
-# --------------------------------------------------------
-nonpaired_metadata = clinical[~clinical["sample_barcode"].isin(sample_barcodes)].copy()
-
-print("Paired samples:", paired_metadata.shape)
-print("Non-paired samples:", nonpaired_metadata.shape)
-#paired_metadata.to_csv("paired_metadata.csv", index=False)
-#nonpaired_metadata.to_csv("nonpaired_metadata.csv", index=False)
-
-# --------------------------------------------------------
-# 6. Sanity checking
-# --------------------------------------------------------
-bad_tumor_format = [t for t in all_tumor if len(t.split("-")) < 4]
-if bad_tumor_format:
-    print("❌ Bad tumor barcode format:", bad_tumor_format)
-else:
-    print("✓ All tumor barcodes have ≥ 4 hyphen-separated parts")
-
-# ---- Sanity Check 2: uniqueness mapping ----
-tumor_to_sample_map = {t: tumor_to_sample(t) for t in all_tumor}
-if len(tumor_to_sample_map.values()) != len(set(tumor_to_sample_map.values())):
-    print("⚠ Warning: multiple tumor barcodes map to the SAME sample barcode (this is normal for replicates).")
-else:
-    print("✓ 1:1 tumor→sample mapping")
-
-# ---- Sanity Check 3: sample exists in clinical metadata ----
-missing_samples = [s for s in sample_barcodes if s not in clinical["sample_barcode"].values]
-if missing_samples:
-    print("❌ Some sample_barcodes not found in clinical metadata:", missing_samples)
-else:
-    print("✓ All sample_barcodes found in clinical_metadata")
-
-# ---- Sanity Check 4: paired_meta should contain all samples ----
-if len(paired_metadata) != len(sample_barcodes):
-    print(f"⚠ Mismatch: {len(sample_barcodes)} extracted samples vs {len(paired_metadata)} clinical matches")
-else:
-    print("✓ paired_metadata perfectly matches extracted sample_barcodes")
-
-print("Sanity checks complete.")
-
-# --------------------------------------------------------
-# 5. Filter non-paired metadata
-# --------------------------------------------------------
-allowed_grades = ["II", "III", "IV"]
-allowed_idh = ["IDHwt", "IDHmut"]
-
-filtered_nonpaired = (
-    nonpaired_metadata
-    .loc[
-        nonpaired_metadata["grade"].isin(allowed_grades) &
-        nonpaired_metadata["idh_status"].isin(allowed_idh)
-    ][[
-        "case_barcode",
-        "sample_barcode",
-        "histology",
-        "grade",
-        "idh_status",
-        "codel_status",
-        "who_classification",
-        "mgmt_methylation"
-    ]]
-)
-
-#filtered_nonpaired.to_csv("nonpaired_filtered.csv", index=False)
-
-# --------------------------------------------------------
-# Subtyping and classifications of tumors 🚨🚨🚨
-# --------------------------------------------------------
-df = filtered_nonpaired.copy()
-# --- Normalization ---
+# ================================================================
+# Utility functions
+# ================================================================
+# Normalization of strings
 def norm(x):
-    if isinstance(x, str):
-        return x.strip().lower()
-    return x
+    return x.strip().lower() if isinstance(x, str) else x
 
-df["idh_norm"] = df["idh_status"].apply(norm)
-df["codel_norm"] = df["codel_status"].apply(norm)
-
+# Map values
 map_idh = {
-    "idhmut": "mut",
-    "idh-mutant": "mut",
-    "mut": "mut",
-    "idhwt": "wt",
-    "idh-wildtype": "wt",
-    "wt": "wt"
+    "idhmut": "mut", "idh-mutant": "mut", "mut": "mut",
+    "idhwt": "wt", "idh-wildtype": "wt", "wt": "wt"
 }
-
 map_codel = {
-    "codel": "codel",
-    "codeleted": "codel",
+    "codel": "codel", "codeleted": "codel",
     "1p/19q-codeleted": "codel",
-    "noncodel": "intact",
-    "intact": "intact"
+    "noncodel": "intact"
 }
-
-df["idh_clean"] = df["idh_norm"].map(map_idh)
-df["codel_clean"] = df["codel_norm"].map(map_codel)
-
-# --- Build subtype from IDH + CODEL ---
-df["molecular_subtype"] = np.nan
-
-df.loc[(df["idh_clean"] == "mut") & (df["codel_clean"] == "codel"),
-       "molecular_subtype"] = "Oligodendroglioma"
-
-df.loc[(df["idh_clean"] == "mut") & (df["codel_clean"] == "intact"),
-       "molecular_subtype"] = "Astrocytoma"
-
-df.loc[(df["idh_clean"] == "wt"),
-       "molecular_subtype"] = "Primary GBM"
-
-# --- Fallback: WHO classification parsing ---
+# Fallback: WHO classification parsing
 def parse_who(x):
     if not isinstance(x, str):
         return np.nan
+
     s = x.lower()
     if "oligodendro" in s:
         return "Oligodendroglioma"
@@ -156,8 +33,159 @@ def parse_who(x):
         return "Primary GBM"
     return np.nan
 
-df.loc[df["molecular_subtype"].isna(), "molecular_subtype"] = \
-    df["who_classification"].apply(parse_who)
+# Convert tumor_barcode → sample_barcode Ex: GLSS-19-0267-TP-RNA-XXXX  → GLSS-19-0267-TP
+def tumor_to_sample(tumor_bc):
+    return "-".join(tumor_bc.split("-")[:4])
 
-print(df["molecular_subtype"].value_counts(dropna=False))
-print(pd.crosstab(df["grade"], df["molecular_subtype"], dropna=False))
+def barcode_to_tpm_format(bc):
+    return bc.replace("-", ".")
+
+
+# ================================================================
+# Load input files
+# ================================================================
+pairs = pd.read_csv("supplementary-data/pairs.csv")
+clinical = pd.read_csv("supplementary-data/clinical_metadata.csv")
+analyte = pd.read_csv("supplementary-data/analysis_analyte_set.csv")
+tpm = pd.read_csv("gene_tpm_all.tsv", sep="\t")
+
+
+# ================================================================
+# Extract paired samples and annotate subtypes
+# ================================================================
+# 1. Extract tumor → sample barcodes
+all_tumor = pd.concat([
+    pairs["tumor_barcode_a"],
+    pairs["tumor_barcode_b"]
+], ignore_index=True).dropna()
+
+sample_barcodes = list({tumor_to_sample(t) for t in all_tumor})
+
+# 2. Subset the clinical metadata
+paired_meta = clinical[clinical["sample_barcode"].isin(sample_barcodes)].copy()
+nonpaired_meta = clinical[~clinical["sample_barcode"].isin(sample_barcodes)].copy()
+
+print(f"✔ Paired samples: {paired_meta.shape[0]}")
+print(f"✔ Non-paired samples: {nonpaired_meta.shape[0]}")
+
+# 3. Normalize paired metadata
+paired = paired_meta.copy()
+paired["idh_norm"] = paired["idh_status"].apply(norm)
+paired["codel_norm"] = paired["codel_status"].apply(norm)
+paired["idh_clean"] = paired["idh_norm"].map(map_idh)
+paired["codel_clean"] = paired["codel_norm"].map(map_codel)
+
+paired["molecular_subtype"] = np.nan
+paired.loc[(paired["idh_clean"]=="mut") & (paired["codel_clean"]=="codel"),  "molecular_subtype"] = "Oligodendroglioma"
+paired.loc[(paired["idh_clean"]=="mut") & (paired["codel_clean"]=="intact"), "molecular_subtype"] = "Astrocytoma"
+paired.loc[(paired["idh_clean"]=="wt"), "molecular_subtype"] = "Primary GBM"
+paired.loc[paired["molecular_subtype"].isna(), "molecular_subtype"] = paired["who_classification"].apply(parse_who)
+
+
+# ================================================================
+# Subtype non-paired samples
+# ================================================================
+allowed_grades = ["II", "III", "IV"]
+allowed_idh = ["IDHwt", "IDHmut"]
+
+filtered_non = nonpaired_meta.loc[
+    nonpaired_meta["grade"].isin(allowed_grades) &
+    nonpaired_meta["idh_status"].isin(allowed_idh)
+].copy()
+
+filtered_non["idh_norm"]   = filtered_non["idh_status"].apply(norm)
+filtered_non["codel_norm"] = filtered_non["codel_status"].apply(norm)
+filtered_non["idh_clean"]  = filtered_non["idh_norm"].map(map_idh)
+filtered_non["codel_clean"]= filtered_non["codel_norm"].map(map_codel)
+
+filtered_non["molecular_subtype"] = np.nan
+filtered_non.loc[(filtered_non["idh_clean"]=="mut") & (filtered_non["codel_clean"]=="codel"),"molecular_subtype"] = "Oligodendroglioma"
+filtered_non.loc[(filtered_non["idh_clean"]=="mut") & (filtered_non["codel_clean"]=="intact"),"molecular_subtype"] = "Astrocytoma"
+filtered_non.loc[(filtered_non["idh_clean"]=="wt"), "molecular_subtype"] = "Primary GBM"
+filtered_non.loc[filtered_non["molecular_subtype"].isna(),"molecular_subtype"] = filtered_non["who_classification"].apply(parse_who)
+
+
+# ================================================================
+# Combine subtype metadata
+# ================================================================
+subtyped_full = pd.concat([paired, filtered_non]).reset_index(drop=True)
+
+cols = [
+    "case_barcode","sample_barcode","histology",
+    "grade","idh_status","codel_status",
+    "who_classification","mgmt_methylation",
+    "molecular_subtype"
+]
+
+subtyped_full = subtyped_full[cols]
+
+subtyped_full.to_csv("subtyped_full_metadata.tsv", sep="\t", index=False)
+print("✔ Exported: subtyped_full_metadata.tsv")
+
+
+# ================================================================
+# Attach RNA barcodes from analyte set
+# ================================================================
+meta = subtyped_full.merge(
+    analyte[["sample_barcode","rna_barcode"]],
+    on="sample_barcode", how="left"
+)
+
+missing = meta["rna_barcode"].isna().sum()
+print(f"✔ RNA barcode missing: {missing}")
+if missing > 0:
+    print(meta[meta["rna_barcode"].isna()])
+    raise ValueError("Some samples missing RNA barcode.")
+
+
+# ================================================================
+# Prepare TPM matrix (sample-matched)
+# ================================================================
+meta["rna_barcode_tpm"] = meta["rna_barcode"].apply(barcode_to_tpm_format)
+
+# pull columns
+cols = ["Gene_symbol"] + [c for c in meta["rna_barcode_tpm"] if c in tpm.columns]
+tpm_samples = tpm[cols]
+
+tpm_samples.to_csv("tpm_sample_filtered.tsv", sep="\t", index=False)
+print("✔ Exported: tpm_sample_filtered.tsv")
+
+
+# ================================================================
+# Gene filtering
+# ================================================================
+expr = tpm_samples.set_index("Gene_symbol")
+
+mask_half = (expr > 0).sum(axis=1) >= expr.shape[1] * 0.5
+mask_mean = expr.mean(axis=1) >= 1
+
+expr_filtered = expr[mask_half & mask_mean]
+expr_filtered.to_csv("tpm_clean.tsv", sep="\t")
+print("✔ Exported: tpm_clean.tsv")
+
+
+# ================================================================
+# Build relation matrix (for DM / OT)
+# ================================================================
+pairs["sample_a"] = pairs["tumor_barcode_a"].apply(tumor_to_sample)
+pairs["sample_b"] = pairs["tumor_barcode_b"].apply(tumor_to_sample)
+
+# join original hyphenated RNA barcodes
+rmat = pairs.merge(
+    meta[["sample_barcode","rna_barcode"]],
+    left_on="sample_a", right_on="sample_barcode",
+    how="left"
+).rename(columns={"rna_barcode":"rna_a"})
+
+rmat = rmat.merge(
+    meta[["sample_barcode","rna_barcode"]],
+    left_on="sample_b", right_on="sample_barcode",
+    how="left"
+).rename(columns={"rna_barcode":"rna_b"})
+
+relation = rmat[[
+    "case_barcode","rna_a","rna_b","surgical_interval_mo"
+]].dropna()
+
+relation.to_csv("relation_matrix.tsv", sep="\t", index=False)
+print("✔ Exported: relation_matrix.tsv")
