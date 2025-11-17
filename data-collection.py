@@ -47,7 +47,7 @@ def barcode_to_tpm_format(bc):
 pairs = pd.read_csv("supplementary-data/pairs.csv")
 clinical = pd.read_csv("supplementary-data/clinical_metadata.csv")
 analyte = pd.read_csv("supplementary-data/analysis_analyte_set.csv")
-tpm = pd.read_csv("gene_tpm_all.tsv", sep="\t")
+tpm = pd.read_csv("supplementary-data/gene_tpm_all.tsv", sep="\t")
 
 
 # ================================================================
@@ -128,7 +128,7 @@ print("✔ Exported: subtyped_full_metadata.tsv")
 # ================================================================
 meta = subtyped_full.merge(
     analyte[["sample_barcode","rna_barcode"]],
-    on="sample_barcode", how="left"
+    on="sample_barcode", how="right"
 )
 
 missing = meta["rna_barcode"].isna().sum()
@@ -147,8 +147,8 @@ meta["rna_barcode_tpm"] = meta["rna_barcode"].apply(barcode_to_tpm_format)
 cols = ["Gene_symbol"] + [c for c in meta["rna_barcode_tpm"] if c in tpm.columns]
 tpm_samples = tpm[cols]
 
-tpm_samples.to_csv("tpm_sample_filtered.tsv", sep="\t", index=False)
-print("✔ Exported: tpm_sample_filtered.tsv")
+tpm_samples.to_csv("filtered_tpm.tsv", sep="\t", index=False)
+print("✔ Exported: filtered_tpm.tsv")
 
 
 # ================================================================
@@ -160,8 +160,8 @@ mask_half = (expr > 0).sum(axis=1) >= expr.shape[1] * 0.5
 mask_mean = expr.mean(axis=1) >= 1
 
 expr_filtered = expr[mask_half & mask_mean]
-expr_filtered.to_csv("tpm_clean.tsv", sep="\t")
-print("✔ Exported: tpm_clean.tsv")
+expr_filtered.to_csv("cleaned_tpm.tsv", sep="\t")
+print("✔ Exported: cleaned_tpm.tsv")
 
 
 # ================================================================
