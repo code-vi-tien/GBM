@@ -40,6 +40,36 @@ def tumor_to_sample(tumor_bc):
 def barcode_to_tpm_format(bc):
     return bc.replace("-", ".")
 
+def annotate_molecular_subtype(df, allowed_grades, allowed_idh, parse_who_fn):
+    df = df.copy()
+    
+    # Initialize molecular_subtype column
+    df['molecular_subtype'] = pd.NA
+    
+    # Only consider rows with allowed grade and IDH
+    mask = df['grade'].isin(allowed_grades) & df['idh_status'].isin(allowed_idh)
+    
+    # Assign molecular_subtype based on idh_codel_subtype
+    df.loc[mask & (df['idh_codel_subtype'] == 'IDHmut-codel'), 'molecular_subtype'] = 'Oligodendroglioma'
+    df.loc[mask & (df['idh_codel_subtype'] == 'IDHmut-noncodel'), 'molecular_subtype'] = 'Astrocytoma'
+    df.loc[mask & (df['idh_codel_subtype'] == 'IDHwt'), 'molecular_subtype'] = 'Primary GBM'
+    
+    # For unresolved rows, use WHO classification
+    unresolved = df['molecular_subtype'].isna()
+    df.loc[unresolved, 'molecular_subtype'] = df.loc[unresolved, 'who_classification'].apply(parse_who_fn)
+    
+    return df
+
+def map_subtype(row):
+    if row['idh_codel_subtype'] == 'IDHmut-codel':
+        return 'Oligo'
+    elif row['idh_codel_subtype'] == 'IDHmut-noncodel':
+        return 'Astro'
+    elif row['idh_codel_subtype'] == 'IDHwt':
+        return 'GBM'
+    else:
+        return None
+    
 
 # ================================================================
 # Load input files
@@ -47,108 +77,136 @@ def barcode_to_tpm_format(bc):
 pairs = pd.read_csv("supplementary-data/pairs.csv")
 clinical = pd.read_csv("supplementary-data/clinical_metadata.csv")
 analyte = pd.read_csv("supplementary-data/analysis_analyte_set.csv")
-tpm = pd.read_csv("supplementary-data/gene_tpm_all.tsv", sep="\t")
+aliquot_batch = pd.read_csv("supplementary-data/biospecimen_aliquots.csv")
+gene_tpm = pd.read_csv('supplementary-data/gene_tpm_all.tsv', sep='\t')
 
 
 # ================================================================
 # Extract paired samples and annotate subtypes
 # ================================================================
-# 1. Extract tumor → sample barcodes
+# 1. Add rna_barcode and batch data
+analyte_unique = analyte.drop_duplicates(subset=['sample_barcode'])
+clinical_with_rna = clinical.merge(analyte[['sample_barcode', 'rna_barcode']], on='sample_barcode', how='left')
+
+# 2. Add aliquot_batch
+aliquot_batch_clean = aliquot_batch.drop(
+    columns=["aliquot_barcode", "aliquot_uuid_short", "aliquot_analyte_type", 
+             "aliquot_analysis_type", "aliquot_portion"]
+).drop_duplicates(subset=['sample_barcode'])
+
+clinical_with_rna = clinical_with_rna.merge(aliquot_batch_clean, on='sample_barcode', how='left')
+
+# 3. Extract tumor → sample barcodes
 all_tumor = pd.concat([
     pairs["tumor_barcode_a"],
     pairs["tumor_barcode_b"]
-], ignore_index=True).dropna()
+], ignore_index=True).dropna().astype(str).str.strip().unique()
 
-sample_barcodes = list({tumor_to_sample(t) for t in all_tumor})
+# 4. Subset the clinical metadata
+paired_meta = clinical_with_rna[
+    clinical_with_rna["rna_barcode"].notna() & clinical_with_rna["rna_barcode"].isin(all_tumor)
+].copy()
+cols = list(paired_meta.columns)
+cols.insert(3, cols.pop(cols.index('rna_barcode')))
+paired_meta = paired_meta[cols]
 
-# 2. Subset the clinical metadata
-paired_meta = clinical[clinical["sample_barcode"].isin(sample_barcodes)].copy()
-nonpaired_meta = clinical[~clinical["sample_barcode"].isin(sample_barcodes)].copy()
+nonpaired_meta = clinical_with_rna[
+    clinical_with_rna["rna_barcode"].isna() | ~clinical_with_rna["rna_barcode"].isin(all_tumor)
+].copy()
+cols = list(nonpaired_meta.columns)
+cols.insert(3, cols.pop(cols.index('rna_barcode')))
+nonpaired_meta = nonpaired_meta[cols]
 
 print(f"✔ Paired samples: {paired_meta.shape[0]}")
 print(f"✔ Non-paired samples: {nonpaired_meta.shape[0]}")
-
-# 3. Normalize paired metadata
-paired = paired_meta.copy()
-paired["idh_norm"] = paired["idh_status"].apply(norm)
-paired["codel_norm"] = paired["codel_status"].apply(norm)
-paired["idh_clean"] = paired["idh_norm"].map(map_idh)
-paired["codel_clean"] = paired["codel_norm"].map(map_codel)
-
-paired["molecular_subtype"] = np.nan
-paired.loc[(paired["idh_clean"]=="mut") & (paired["codel_clean"]=="codel"),  "molecular_subtype"] = "Oligodendroglioma"
-paired.loc[(paired["idh_clean"]=="mut") & (paired["codel_clean"]=="intact"), "molecular_subtype"] = "Astrocytoma"
-paired.loc[(paired["idh_clean"]=="wt"), "molecular_subtype"] = "Primary GBM"
-paired.loc[paired["molecular_subtype"].isna(), "molecular_subtype"] = paired["who_classification"].apply(parse_who)
+#nonpaired_meta.to_csv("raw_nonpaired_metadata.csv", index=False)
+#paired_meta.to_csv("raw_paired_metadata.csv", index=False)
 
 
 # ================================================================
-# Subtype non-paired samples
+# Annotate molecular subtype for paired and non-paired
 # ================================================================
 allowed_grades = ["II", "III", "IV"]
 allowed_idh = ["IDHwt", "IDHmut"]
 
-filtered_non = nonpaired_meta.loc[
-    nonpaired_meta["grade"].isin(allowed_grades) &
-    nonpaired_meta["idh_status"].isin(allowed_idh)
-].copy()
+paired = annotate_molecular_subtype(
+    paired_meta,
+    allowed_grades,
+    allowed_idh,
+    parse_who
+)
+#paired.to_csv("subtyped_paired_metadata.csv", index=False)
+nonpaired = annotate_molecular_subtype(
+    nonpaired_meta,
+    allowed_grades,
+    allowed_idh,
+    parse_who
+)
+#nonpaired.to_csv("subtyped_nonpaired_metadata.csv", index=False)
 
-filtered_non["idh_norm"]   = filtered_non["idh_status"].apply(norm)
-filtered_non["codel_norm"] = filtered_non["codel_status"].apply(norm)
-filtered_non["idh_clean"]  = filtered_non["idh_norm"].map(map_idh)
-filtered_non["codel_clean"]= filtered_non["codel_norm"].map(map_codel)
+required_cols = [
+    'case_barcode','sample_barcode','rna_barcode','molecular_subtype'
+]
 
-filtered_non["molecular_subtype"] = np.nan
-filtered_non.loc[(filtered_non["idh_clean"]=="mut") & (filtered_non["codel_clean"]=="codel"),"molecular_subtype"] = "Oligodendroglioma"
-filtered_non.loc[(filtered_non["idh_clean"]=="mut") & (filtered_non["codel_clean"]=="intact"),"molecular_subtype"] = "Astrocytoma"
-filtered_non.loc[(filtered_non["idh_clean"]=="wt"), "molecular_subtype"] = "Primary GBM"
-filtered_non.loc[filtered_non["molecular_subtype"].isna(),"molecular_subtype"] = filtered_non["who_classification"].apply(parse_who)
+paired = paired.dropna(subset=['rna_barcode', "case_barcode", 'sample_barcode'])
+nonpaired = nonpaired.dropna(subset=['rna_barcode', "case_barcode", 'sample_barcode'])
+
+# Sampling according to target
+target = {
+    ('II','Oligo'): 12,
+    ('II','Astro'): 20,
+    ('II','GBM'): 3,
+    ('III','Oligo'): 15,
+    ('III','Astro'): 14,
+    ('III','GBM'): 9,
+    ('IV','Oligo'): 0,
+    ('IV','Astro'): 7,
+    ('IV','GBM'): 52
+}
+
+nonpaired['subtype'] = nonpaired.apply(map_subtype, axis=1)
+
+samples_list = []
+
+for (grade, subtype), n_samples in target.items():
+    if n_samples == 0:
+        continue
+    subset = nonpaired[(nonpaired['grade'] == grade) & (nonpaired['subtype'] == subtype)]
+    
+    # If there are fewer rows than n_samples, take all rows
+    n_select = min(len(subset), n_samples)
+    
+    selected = subset.sample(n=n_select, random_state=42)
+    samples_list.append(selected)
+
+nonpaired = pd.concat(samples_list)
+
+# Reset index
+nonpaired = nonpaired.reset_index(drop=True)
 
 
 # ================================================================
 # Combine subtype metadata
 # ================================================================
-subtyped_full = pd.concat([paired, filtered_non]).reset_index(drop=True)
+subtyped_full = pd.concat([paired, nonpaired]).reset_index(drop=True)
 
-cols = [
-    "case_barcode","sample_barcode","histology",
-    "grade","idh_status","codel_status",
-    "who_classification","mgmt_methylation",
-    "molecular_subtype"
-]
+# Export
+subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
+print("✔ Exported: subtyped_full_metadata.csv")
+print(subtyped_full.isna().sum())
 
-subtyped_full = subtyped_full[cols]
-
-subtyped_full.to_csv("subtyped_full_metadata.tsv", sep="\t", index=False)
-print("✔ Exported: subtyped_full_metadata.tsv")
-
-
-# ================================================================
-# Attach RNA barcodes from analyte set
-# ================================================================
-meta = subtyped_full.merge(
-    analyte[["sample_barcode","rna_barcode"]],
-    on="sample_barcode", how="right"
-)
-
-missing = meta["rna_barcode"].isna().sum()
-print(f"✔ RNA barcode missing: {missing}")
-if missing > 0:
-    print(meta[meta["rna_barcode"].isna()])
-    raise ValueError("Some samples missing RNA barcode.")
-
-
+'''
 # ================================================================
 # Prepare TPM matrix (sample-matched)
 # ================================================================
-meta["rna_barcode_tpm"] = meta["rna_barcode"].apply(barcode_to_tpm_format)
+subtyped_full["rna_barcode_tpm"] = subtyped_full["rna_barcode"].apply(barcode_to_tpm_format)
 
 # pull columns
-cols = ["Gene_symbol"] + [c for c in meta["rna_barcode_tpm"] if c in tpm.columns]
+cols = ["Gene_symbol"] + [c for c in subtyped_full["rna_barcode_tpm"] if c in tpm.columns]
 tpm_samples = tpm[cols]
 
-tpm_samples.to_csv("filtered_tpm.tsv", sep="\t", index=False)
-print("✔ Exported: filtered_tpm.tsv")
+tpm_samples.to_csv("filtered_tpm.csv",index=False)
+print("✔ Exported: filtered_tpm.csv")
 
 
 # ================================================================
@@ -160,10 +218,10 @@ mask_half = (expr > 0).sum(axis=1) >= expr.shape[1] * 0.5
 mask_mean = expr.mean(axis=1) >= 1
 
 expr_filtered = expr[mask_half & mask_mean]
-expr_filtered.to_csv("cleaned_tpm.tsv", sep="\t")
-print("✔ Exported: cleaned_tpm.tsv")
-
-
+expr_filtered.to_csv("cleaned_tpm.csv")
+print("✔ Exported: cleaned_tpm.csv")
+'''
+'''
 # ================================================================
 # Build relation matrix (for DM / OT)
 # ================================================================
@@ -187,5 +245,6 @@ relation = rmat[[
     "case_barcode","rna_a","rna_b","surgical_interval_mo"
 ]].dropna()
 
-relation.to_csv("relation_matrix.tsv", sep="\t", index=False)
-print("✔ Exported: relation_matrix.tsv")
+relation.to_csv("relation_matrix.csv", index=False)
+print("✔ Exported: relation_matrix.csv")
+'''
