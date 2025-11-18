@@ -242,7 +242,7 @@ available_barcodes = gene_tpm.columns.intersection(columns_to_keep)
 gene_tpm = gene_tpm[available_barcodes]
 print(gene_tpm.shape)
 
-gene_tpm.to_csv("filtered_tpm.csv",index=False)
+#gene_tpm.to_csv("filtered_tpm.csv",index=False)
 print("✔ Exported: filtered_tpm.csv")
 
 
@@ -256,33 +256,51 @@ mask_mean = expr.mean(axis=1) >= 1
 
 expr_filtered = expr[mask_half & mask_mean]
 print(expr_filtered.shape)
-expr_filtered.to_csv("cleaned_tpm.csv")
+#expr_filtered.to_csv("cleaned_tpm.csv")
 print("✔ Exported: cleaned_tpm.csv")
 
-'''
+
 # ================================================================
 # Build relation matrix (for DM / OT)
 # ================================================================
-pairs["sample_a"] = pairs["tumor_barcode_a"].apply(tumor_to_sample)
-pairs["sample_b"] = pairs["tumor_barcode_b"].apply(tumor_to_sample)
+valid_rna_barcodes = set(subtyped_full['rna_barcode'].unique())
+print(len(valid_rna_barcodes))
 
-# join original hyphenated RNA barcodes
-rmat = pairs.merge(
-    meta[["sample_barcode","rna_barcode"]],
-    left_on="sample_a", right_on="sample_barcode",
-    how="left"
-).rename(columns={"rna_barcode":"rna_a"})
+relevant_pairs = pairs[
+    (pairs['tumor_barcode_a'].isin(valid_rna_barcodes)) &
+    (pairs['tumor_barcode_b'].isin(valid_rna_barcodes))
+].copy()
 
-rmat = rmat.merge(
-    meta[["sample_barcode","rna_barcode"]],
-    left_on="sample_b", right_on="sample_barcode",
-    how="left"
-).rename(columns={"rna_barcode":"rna_b"})
+all_samples = sorted(list(
+    set(relevant_pairs['tumor_barcode_a']).union(set(relevant_pairs['tumor_barcode_b']))
+))
 
-relation = rmat[[
-    "case_barcode","rna_a","rna_b","surgical_interval_mo"
-]].dropna()
+N = len(all_samples)
+relation_matrix_np = np.zeros((N, N), dtype=int)
 
-relation.to_csv("relation_matrix.csv", index=False)
-print("✔ Exported: relation_matrix.csv")
-'''
+# Map sample names (barcodes) to their index (0 to N-1)
+barcode_to_index = {barcode: i for i, barcode in enumerate(all_samples)}
+
+# Populate the matrix based on the pairings
+for _, row in relevant_pairs.iterrows():
+    barcode_a = row['tumor_barcode_a']
+    barcode_b = row['tumor_barcode_b']
+    
+    # Get the indices
+    idx_a = barcode_to_index[barcode_a]
+    idx_b = barcode_to_index[barcode_b]
+    
+    # Set the relationship (A <-> B)
+    # The matrix must be symmetric to represent an undirected connection
+    relation_matrix_np[idx_a, idx_b] = 1
+    relation_matrix_np[idx_b, idx_a] = 1
+
+adjacency_matrix = pd.DataFrame(
+    relation_matrix_np, 
+    index=all_samples, 
+    columns=all_samples
+)
+print(f"Paired Relation Matrix Shape: {adjacency_matrix.shape}")
+
+adjacency_matrix.to_csv("adjacency_matrix.csv")
+print("✔ Exported: adjacency_matrix.csv")
