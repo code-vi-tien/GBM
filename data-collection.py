@@ -124,10 +124,14 @@ print(f"✔ Non-paired samples: {nonpaired_meta.shape[0]}")
 
 
 # ================================================================
-# Annotate molecular subtype for paired and non-paired
+# Annotate molecular subtype for paired and non-paired and Filter
 # ================================================================
 allowed_grades = ["II", "III", "IV"]
 allowed_idh = ["IDHwt", "IDHmut"]
+
+rna_barcodes = gene_tpm.columns[1:]  # assuming first column is gene names
+rna_barcodes = [bc.replace('.', '-') for bc in rna_barcodes]
+rna_barcodes_set = set(rna_barcodes)  
 
 paired = annotate_molecular_subtype(
     paired_meta,
@@ -135,13 +139,16 @@ paired = annotate_molecular_subtype(
     allowed_idh,
     parse_who
 )
+paired = paired[paired['rna_barcode'].isin(rna_barcodes_set)].copy()
 #paired.to_csv("subtyped_paired_metadata.csv", index=False)
+
 nonpaired = annotate_molecular_subtype(
     nonpaired_meta,
     allowed_grades,
     allowed_idh,
     parse_who
 )
+nonpaired = nonpaired[nonpaired['rna_barcode'].isin(rna_barcodes_set)].copy()
 #nonpaired.to_csv("subtyped_nonpaired_metadata.csv", index=False)
 
 required_cols = [
@@ -164,6 +171,12 @@ target = {
     ('IV','GBM'): 52
 }
 
+nonpaired = nonpaired.sort_values(
+    by=['case_barcode', 'surgery_number'], # Use the actual chronological column here
+    ascending=True
+)
+nonpaired = nonpaired.groupby('case_barcode', as_index=False).first()
+
 nonpaired['subtype'] = nonpaired.apply(map_subtype, axis=1)
 
 samples_list = []
@@ -171,18 +184,34 @@ samples_list = []
 for (grade, subtype), n_samples in target.items():
     if n_samples == 0:
         continue
-    subset = nonpaired[(nonpaired['grade'] == grade) & (nonpaired['subtype'] == subtype)]
-    
-    # If there are fewer rows than n_samples, take all rows
-    n_select = min(len(subset), n_samples)
-    
-    selected = subset.sample(n=n_select, random_state=42)
-    samples_list.append(selected)
 
-nonpaired = pd.concat(samples_list)
+    # Subset the compressed DataFrame
+    subset = nonpaired[
+        (nonpaired['grade'] == grade) &
+        (nonpaired['subtype'] == subtype)
+    ]
+    
+    # Identify unique cases (already unique in this DataFrame)
+    unique_cases = subset['case_barcode'].unique()
+    
+    # Determine how many cases to select
+    n_select = min(len(unique_cases), n_samples)
+    
+    # Sample the cases randomly
+    sampled_cases = np.random.default_rng(seed=42).choice(
+        unique_cases,
+        size=n_select,
+        replace=False
+    )
+    
+    # Select the corresponding rows (which are the full samples)
+    selected_rows = subset[subset['case_barcode'].isin(sampled_cases)]
+    samples_list.append(selected_rows)
 
-# Reset index
-nonpaired = nonpaired.reset_index(drop=True)
+nonpaired = pd.concat(samples_list).reset_index(drop=True)
+
+# Final export of the result containing only the selected first samples with all original columns
+#nonpaired.to_csv('selected_nonpaired_metadata.csv', index=False)
 
 
 # ================================================================
@@ -191,36 +220,45 @@ nonpaired = nonpaired.reset_index(drop=True)
 subtyped_full = pd.concat([paired, nonpaired]).reset_index(drop=True)
 
 # Export
-subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
+#subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
 print("✔ Exported: subtyped_full_metadata.csv")
-print(subtyped_full.isna().sum())
 
-'''
+
 # ================================================================
 # Prepare TPM matrix (sample-matched)
 # ================================================================
-subtyped_full["rna_barcode_tpm"] = subtyped_full["rna_barcode"].apply(barcode_to_tpm_format)
+new_columns = [
+    col.replace('.', '-') if col != gene_tpm.columns[0] else col 
+    for col in gene_tpm.columns
+]
+gene_tpm.columns = new_columns
 
-# pull columns
-cols = ["Gene_symbol"] + [c for c in subtyped_full["rna_barcode_tpm"] if c in tpm.columns]
-tpm_samples = tpm[cols]
+required_barcodes = subtyped_full['rna_barcode'].unique().tolist()
 
-tpm_samples.to_csv("filtered_tpm.csv",index=False)
+columns_to_keep = [gene_tpm.columns[0]] + required_barcodes
+
+available_barcodes = gene_tpm.columns.intersection(columns_to_keep)
+
+gene_tpm = gene_tpm[available_barcodes]
+print(gene_tpm.shape)
+
+gene_tpm.to_csv("filtered_tpm.csv",index=False)
 print("✔ Exported: filtered_tpm.csv")
 
 
 # ================================================================
 # Gene filtering
 # ================================================================
-expr = tpm_samples.set_index("Gene_symbol")
+expr = gene_tpm.set_index("Gene_symbol")
 
 mask_half = (expr > 0).sum(axis=1) >= expr.shape[1] * 0.5
 mask_mean = expr.mean(axis=1) >= 1
 
 expr_filtered = expr[mask_half & mask_mean]
+print(expr_filtered.shape)
 expr_filtered.to_csv("cleaned_tpm.csv")
 print("✔ Exported: cleaned_tpm.csv")
-'''
+
 '''
 # ================================================================
 # Build relation matrix (for DM / OT)
