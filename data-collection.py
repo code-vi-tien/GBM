@@ -79,7 +79,12 @@ clinical = pd.read_csv("supplementary-data/clinical_metadata.csv")
 analyte = pd.read_csv("supplementary-data/analysis_analyte_set.csv")
 aliquot_batch = pd.read_csv("supplementary-data/biospecimen_aliquots.csv")
 gene_tpm = pd.read_csv('supplementary-data/gene_tpm_all.tsv', sep='\t')
-
+# Normalize tpm
+new_columns = [
+    col.replace('.', '-') if col != gene_tpm.columns[0] else col 
+    for col in gene_tpm.columns
+]
+gene_tpm.columns = new_columns
 
 # ================================================================
 # Extract paired samples and annotate subtypes
@@ -109,6 +114,8 @@ paired_meta = clinical_with_rna[
 cols = list(paired_meta.columns)
 cols.insert(3, cols.pop(cols.index('rna_barcode')))
 paired_meta = paired_meta[cols]
+# Drop duplicated rna_barcodes in paired
+paired_meta = paired_meta.drop_duplicates(subset='rna_barcode', keep='first')
 
 nonpaired_meta = clinical_with_rna[
     clinical_with_rna["rna_barcode"].isna() | ~clinical_with_rna["rna_barcode"].isin(all_tumor)
@@ -120,8 +127,7 @@ nonpaired_meta = nonpaired_meta[cols]
 print(f"✔ Paired samples: {paired_meta.shape[0]}")
 print(f"✔ Non-paired samples: {nonpaired_meta.shape[0]}")
 #nonpaired_meta.to_csv("raw_nonpaired_metadata.csv", index=False)
-#paired_meta.to_csv("raw_paired_metadata.csv", index=False)
-
+paired_meta.to_csv("raw_paired_metadata.csv", index=False)
 
 # ================================================================
 # Annotate molecular subtype for paired and non-paired and Filter
@@ -131,7 +137,7 @@ allowed_idh = ["IDHwt", "IDHmut"]
 
 rna_barcodes = gene_tpm.columns[1:]  # assuming first column is gene names
 rna_barcodes = [bc.replace('.', '-') for bc in rna_barcodes]
-rna_barcodes_set = set(rna_barcodes)  
+rna_barcodes_set = set(rna_barcodes)
 
 paired = annotate_molecular_subtype(
     paired_meta,
@@ -140,7 +146,8 @@ paired = annotate_molecular_subtype(
     parse_who
 )
 paired = paired[paired['rna_barcode'].isin(rna_barcodes_set)].copy()
-#paired.to_csv("subtyped_paired_metadata.csv", index=False)
+print(f'Paired after filtered with tpm: {paired.shape}')
+paired.to_csv("subtyped_paired_metadata.csv", index=False)
 
 nonpaired = annotate_molecular_subtype(
     nonpaired_meta,
@@ -149,6 +156,7 @@ nonpaired = annotate_molecular_subtype(
     parse_who
 )
 nonpaired = nonpaired[nonpaired['rna_barcode'].isin(rna_barcodes_set)].copy()
+print(f'Nonpaired after filtered with tpm: {nonpaired.shape}')
 #nonpaired.to_csv("subtyped_nonpaired_metadata.csv", index=False)
 
 required_cols = [
@@ -156,7 +164,9 @@ required_cols = [
 ]
 
 paired = paired.dropna(subset=['rna_barcode', "case_barcode", 'sample_barcode'])
+print(f'after drop na {paired.shape}')
 nonpaired = nonpaired.dropna(subset=['rna_barcode', "case_barcode", 'sample_barcode'])
+print(f'after drop na {nonpaired.shape}')
 
 # Sampling according to target
 target = {
@@ -209,6 +219,7 @@ for (grade, subtype), n_samples in target.items():
     samples_list.append(selected_rows)
 
 nonpaired = pd.concat(samples_list).reset_index(drop=True)
+print(f'after selected nonpaired: {nonpaired.shape}')
 
 # Final export of the result containing only the selected first samples with all original columns
 #nonpaired.to_csv('selected_nonpaired_metadata.csv', index=False)
@@ -220,29 +231,27 @@ nonpaired = pd.concat(samples_list).reset_index(drop=True)
 subtyped_full = pd.concat([paired, nonpaired]).reset_index(drop=True)
 
 # Export
-#subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
+subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
 print("✔ Exported: subtyped_full_metadata.csv")
+print(f'full: {subtyped_full.shape}')
 
 
 # ================================================================
 # Prepare TPM matrix (sample-matched)
 # ================================================================
-new_columns = [
-    col.replace('.', '-') if col != gene_tpm.columns[0] else col 
-    for col in gene_tpm.columns
-]
-gene_tpm.columns = new_columns
-
-required_barcodes = subtyped_full['rna_barcode'].unique().tolist()
+required_barcodes = subtyped_full['rna_barcode'].tolist()
+print(len(required_barcodes))
 
 columns_to_keep = [gene_tpm.columns[0]] + required_barcodes
+print(len(columns_to_keep))
 
 available_barcodes = gene_tpm.columns.intersection(columns_to_keep)
+print(available_barcodes.shape)
 
 gene_tpm = gene_tpm[available_barcodes]
 print(gene_tpm.shape)
 
-#gene_tpm.to_csv("filtered_tpm.csv",index=False)
+gene_tpm.to_csv("filtered_tpm.csv",index=False)
 print("✔ Exported: filtered_tpm.csv")
 
 
@@ -256,51 +265,43 @@ mask_mean = expr.mean(axis=1) >= 1
 
 expr_filtered = expr[mask_half & mask_mean]
 print(expr_filtered.shape)
-#expr_filtered.to_csv("cleaned_tpm.csv")
+expr_filtered.to_csv("cleaned_tpm.csv")
 print("✔ Exported: cleaned_tpm.csv")
 
 
 # ================================================================
 # Build relation matrix (for DM / OT)
 # ================================================================
-valid_rna_barcodes = set(subtyped_full['rna_barcode'].unique())
-print(len(valid_rna_barcodes))
+all_rna_barcodes = sorted(subtyped_full['rna_barcode'].unique())
+N = len(all_rna_barcodes)
 
-relevant_pairs = pairs[
-    (pairs['tumor_barcode_a'].isin(valid_rna_barcodes)) &
-    (pairs['tumor_barcode_b'].isin(valid_rna_barcodes))
-].copy()
+# Create index mapping
+barcode_to_index = {barcode: i for i, barcode in enumerate(all_rna_barcodes)}
 
-all_samples = sorted(list(
-    set(relevant_pairs['tumor_barcode_a']).union(set(relevant_pairs['tumor_barcode_b']))
-))
-
-N = len(all_samples)
+# Initialize adjacency matrix (NxN)
 relation_matrix_np = np.zeros((N, N), dtype=int)
 
-# Map sample names (barcodes) to their index (0 to N-1)
-barcode_to_index = {barcode: i for i, barcode in enumerate(all_samples)}
+# Filter pairs to only include barcodes that are in subtyped_full
+valid_pairs = pairs[
+    (pairs['tumor_barcode_a'].isin(all_rna_barcodes)) &
+    (pairs['tumor_barcode_b'].isin(all_rna_barcodes))
+]
 
-# Populate the matrix based on the pairings
-for _, row in relevant_pairs.iterrows():
-    barcode_a = row['tumor_barcode_a']
-    barcode_b = row['tumor_barcode_b']
-    
-    # Get the indices
-    idx_a = barcode_to_index[barcode_a]
-    idx_b = barcode_to_index[barcode_b]
-    
-    # Set the relationship (A <-> B)
-    # The matrix must be symmetric to represent an undirected connection
+# Populate adjacency matrix
+for _, row in valid_pairs.iterrows():
+    idx_a = barcode_to_index[row['tumor_barcode_a']]
+    idx_b = barcode_to_index[row['tumor_barcode_b']]
     relation_matrix_np[idx_a, idx_b] = 1
-    relation_matrix_np[idx_b, idx_a] = 1
+    relation_matrix_np[idx_b, idx_a] = 1  # make symmetric
 
+# Convert to DataFrame
 adjacency_matrix = pd.DataFrame(
-    relation_matrix_np, 
-    index=all_samples, 
-    columns=all_samples
+    relation_matrix_np,
+    index=all_rna_barcodes,
+    columns=all_rna_barcodes
 )
-print(f"Paired Relation Matrix Shape: {adjacency_matrix.shape}")
+
+print(f"Adjacency matrix shape: {adjacency_matrix.shape}")
 
 adjacency_matrix.to_csv("adjacency_matrix.csv")
 print("✔ Exported: adjacency_matrix.csv")
