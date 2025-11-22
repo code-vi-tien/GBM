@@ -3,6 +3,7 @@ library(GSVA)
 library(GSEABase)
 library(phateR)
 library(xCell)
+library(pracma)
 
 # =====================================
 # Step 0: Load TPM and metadata
@@ -17,26 +18,85 @@ if(!all(colnames(tpm_mat) %in% meta_df$rna_barcode)){
 
 # Log2-transform TPM
 tpm_log <- log2(tpm_mat + 1)
+# =====================================
+# DIAGNOSTIC: Check metadata columns
+# =====================================
+cat("=== METADATA DIAGNOSTICS ===\n")
+cat("Total samples in metadata:", nrow(meta_df), "\n")
+cat("\nColumn names in metadata:\n")
+print(colnames(meta_df))
+
+cat("\n--- Checking 'grade' column ---\n")
+if("grade" %in% colnames(meta_df)){
+  cat("Unique grades:\n")
+  print(table(meta_df$grade, useNA = "ifany"))
+} else {
+  cat("⚠ 'grade' column not found!\n")
+  cat("Available columns:", paste(colnames(meta_df), collapse=", "), "\n")
+}
+
+cat("\n--- Checking 'subtype' column ---\n")
+if("subtype" %in% colnames(meta_df)){
+  cat("Unique molecular subtypes:\n")
+  print(table(meta_df$subtype, useNA = "ifany"))
+} else {
+  cat("⚠ 'subtype' column not found!\n")
+  cat("Available columns:", paste(colnames(meta_df), collapse=", "), "\n")
+}
 
 # =====================================
-# Step 1: Stratify samples
+# Step 1: Stratify samples (FIXED)
 # =====================================
-meta_df$stratum <- paste(meta_df$grade, meta_df$molecular_subtype, sep="_")
-strata <- unique(meta_df$stratum)
+cat("\n=== CREATING STRATA ===\n")
+
+# Check if required columns exist
+required_cols <- c("grade", "subtype")
+missing_cols <- setdiff(required_cols, colnames(meta_df))
+
+if(length(missing_cols) > 0){
+  stop("Missing required columns: ", paste(missing_cols, collapse=", "))
+}
+
+# Remove samples with NA in stratification variables
+meta_df_clean <- meta_df[!is.na(meta_df$grade) & !is.na(meta_df$subtype), ]
+
+cat("Samples before NA removal:", nrow(meta_df), "\n")
+cat("Samples after NA removal:", nrow(meta_df_clean), "\n")
+
+if(nrow(meta_df_clean) == 0){
+  stop("No samples remaining after removing NAs from grade/subtype!")
+}
+
+# Create stratum column
+meta_df_clean$stratum <- paste(meta_df_clean$grade, meta_df_clean$subtype, sep="_")
+strata <- unique(meta_df_clean$stratum)
+
+cat("\nStrata created:\n")
+print(table(meta_df_clean$stratum))
+cat("\nTotal strata:", length(strata), "\n\n")
+
+if(length(strata) == 0){
+  stop("No strata were created! Check your metadata.")
+}
 
 # =====================================
 # Step 2: Load MSigDB GMT files
 # =====================================
+cat("=== LOADING GENE SETS ===\n")
 g_h <- getGmt("supplementary-data/h.all.v2025.1.Hs.symbols.gmt")
 g_c2 <- getGmt("supplementary-data/c2.all.v2025.1.Hs.symbols.gmt")
 
 # Convert GeneSetCollection to list of gene vectors
-genesets_list <- lapply(c(g_h, g_c2), geneIds)
+gsc_all <- GeneSetCollection(c(g_h, g_c2))
+
+# Convert to named list of gene vectors
+genesets_list <- lapply(gsc_all, geneIds)
+names(genesets_list) <- sapply(gsc_all, setName)
 
 # =====================================
 # DIAGNOSTIC: Check gene ID overlap
 # =====================================
-cat("Checking gene ID format...\n")
+cat("\nChecking gene ID format...\n")
 cat("First 5 genes in expression data:\n")
 print(head(rownames(tpm_log), 5))
 
@@ -55,50 +115,81 @@ cat("Genes overlapping:", length(overlap), "\n")
 if(length(overlap) < 100){
   cat("\n⚠ WARNING: Very few overlapping genes!\n")
   cat("Gene ID format might be mismatched.\n")
-  cat("Common issues:\n")
-  cat("- Expression data uses Ensembl IDs (ENSG...) but gene sets use symbols\n")
-  cat("- Version differences in gene symbols\n")
-  cat("- Case sensitivity issues\n\n")
-  
-  # Attempt to detect Ensembl IDs
-  if(any(grepl("^ENSG", rownames(tpm_log)))){
-    stop("Expression data appears to use Ensembl IDs, but gene sets use gene symbols. Please convert your TPM matrix row names to gene symbols first.")
-  }
 }
 
 # Filter gene sets to only include genes present in expression data
 cat("\nFiltering gene sets to match expression data...\n")
-genesets_filtered <- filterGeneSets(genesets_list, rownames(tpm_log))
+genesets_filtered <- lapply(genesets_list, function(gs) {
+  intersect(gs, rownames(tpm_log))
+})
+
+# Remove empty gene sets (names automatically preserved)
+keep_sets <- sapply(genesets_filtered, length) >= 5
+genesets_filtered <- genesets_filtered[keep_sets]
+
 cat("Gene sets after filtering:", length(genesets_filtered), "\n")
+cat("First 3 gene set names:\n")
+print(names(genesets_filtered)[1:3])
+cat("Gene sets have names? ", !is.null(names(genesets_filtered)), "\n")
 
 # Check size distribution
 set_sizes <- sapply(genesets_filtered, length)
-cat("Gene set size range:", min(set_sizes), "-", max(set_sizes), "\n")
+if(length(set_sizes) > 0){
+  cat("Gene set size range:", min(set_sizes), "-", max(set_sizes), "\n")
+} else {
+  cat("⚠ No gene sets remaining after filtering!\n")
+}
 cat("Gene sets with ≥5 genes:", sum(set_sizes >= 5), "\n\n")
 
 # =====================================
 # Step 3: Stratified GSVA + xCell
 # =====================================
+cat("=== RUNNING STRATIFIED ANALYSIS ===\n")
 stratified_results <- list()
 cell_fraction_results <- list()
 
 for(s in strata){
   
-  cat("Processing stratum:", s, "\n")
+  cat("\n--- Processing stratum:", s, "---\n")
   
-  # Subset TPM
-  samples_in_stratum <- meta_df$rna_barcode[meta_df$stratum == s]
+  # Subset TPM using cleaned metadata
+  samples_in_stratum <- meta_df_clean$rna_barcode[meta_df_clean$stratum == s]
+  
+  # Ensure samples exist in TPM matrix
+  samples_in_stratum <- intersect(samples_in_stratum, colnames(tpm_log))
+  
+  if(length(samples_in_stratum) == 0){
+    cat("  ⚠ No samples found for this stratum. Skipping.\n")
+    next
+  }
+  
   tpm_sub <- tpm_log[, samples_in_stratum, drop=FALSE]
   
   cat("  Samples:", length(samples_in_stratum), "\n")
   
   # --- GSVA with GSVA 2.x syntax ---
   # Create parameter object with filtered gene sets
+  cat("  Checking row names after subsetting...\n")
+  cat("    First 5 row names of tpm_sub:", head(rownames(tpm_sub), 5), "\n")
+  cat("    Row names exist?", !is.null(rownames(tpm_sub)), "\n")
+  cat("    Testing overlap with gene sets:", 
+      length(intersect(rownames(tpm_sub), genesets_filtered[[1]])), "\n")
+
+  # Convert to matrix explicitly with row names preserved
+  tpm_sub_mat <- as.matrix(tpm_sub)
+  cat("    Row names after as.matrix():", head(rownames(tpm_sub_mat), 5), "\n")
+
+  cat("  Converting gene sets to GeneSetCollection...\n")
+  gsc <- GeneSetCollection(lapply(names(genesets_filtered), function(nm) {
+    GeneSet(genesets_filtered[[nm]], setName = nm)
+  }))
+  cat("  GeneSetCollection created with", length(gsc), "gene sets\n")
+
   gsva_par <- gsvaParam(
     exprData = as.matrix(tpm_sub),
     geneSets = genesets_filtered,
     kcdf = "Gaussian",
-    minSize = 5,  # Increased from 1 to avoid tiny gene sets
+    minSize = 5,
     maxSize = 5000
   )
   
@@ -120,16 +211,21 @@ for(s in strata){
   stratified_results[[s]] <- combined
   cell_fraction_results[[s]] <- xcell_res
   
-  cat("  Total features:", nrow(combined), "\n\n")
+  cat("  Total features:", nrow(combined), "\n")
 }
+
+cat("\n=== ANALYSIS SUMMARY ===\n")
+cat("Strata processed:", length(stratified_results), "\n")
+cat("Stratum names:", paste(names(stratified_results), collapse=", "), "\n")
 
 # =====================================
 # Step 4: PHATE embedding per stratum
 # =====================================
+cat("\n=== CREATING PHATE EMBEDDINGS ===\n")
 phate_embeddings <- list()
 
 for(s in names(stratified_results)){
-  cat("PHATE embedding for stratum:", s, "\n")
+  cat("\nPHATE embedding for stratum:", s, "\n")
   
   # PHATE expects samples x features
   phate_obj <- phate(t(stratified_results[[s]]))
@@ -148,6 +244,7 @@ for(s in names(stratified_results)){
 # =====================================
 # Save combined results
 # =====================================
+cat("\n=== SAVING RESULTS ===\n")
 saveRDS(stratified_results, "exports/stratified_gsva_xcell.rds")
 saveRDS(cell_fraction_results, "exports/stratified_xcell_only.rds")
 saveRDS(phate_embeddings, "exports/phate_embeddings.rds")
@@ -155,3 +252,7 @@ saveRDS(phate_embeddings, "exports/phate_embeddings.rds")
 cat("\n✓ Analysis complete!\n")
 cat("  - Stratified GSVA+xCell results saved\n")
 cat("  - PHATE embeddings exported per stratum\n")
+cat("\nFinal check:\n")
+cat("  stratified_results length:", length(stratified_results), "\n")
+cat("  cell_fraction_results length:", length(cell_fraction_results), "\n")
+cat("  phate_embeddings length:", length(phate_embeddings), "\n")
