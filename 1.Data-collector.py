@@ -74,11 +74,11 @@ def map_subtype(row):
 # ================================================================
 # Load input files
 # ================================================================
-pairs = pd.read_csv("supplementary-data/pairs.csv")
-clinical = pd.read_csv("supplementary-data/clinical_metadata.csv")
-analyte = pd.read_csv("supplementary-data/analysis_analyte_set.csv")
-aliquot_batch = pd.read_csv("supplementary-data/biospecimen_aliquots.csv")
-gene_tpm = pd.read_csv('supplementary-data/gene_tpm_all.tsv', sep='\t')
+pairs = pd.read_csv("og-supplementary-data/pairs.csv")
+clinical = pd.read_csv("og-supplementary-data/clinical_metadata.csv")
+analyte = pd.read_csv("og-supplementary-data/analysis_analyte_set.csv")
+aliquot_batch = pd.read_csv("og-supplementary-data/biospecimen_aliquots.csv")
+gene_tpm = pd.read_csv('og-supplementary-data/gene_tpm_all.tsv', sep='\t')
 # Normalize tpm
 new_columns = [
     col.replace('.', '-') if col != gene_tpm.columns[0] else col 
@@ -127,7 +127,7 @@ nonpaired_meta = nonpaired_meta[cols]
 print(f"✔ Paired samples: {paired_meta.shape[0]}")
 print(f"✔ Non-paired samples: {nonpaired_meta.shape[0]}")
 #nonpaired_meta.to_csv("raw_nonpaired_metadata.csv", index=False)
-paired_meta.to_csv("raw_paired_metadata.csv", index=False)
+#paired_meta.to_csv("raw_paired_metadata.csv", index=False)
 
 # ================================================================
 # Annotate molecular subtype for paired and non-paired and Filter
@@ -147,7 +147,7 @@ paired = annotate_molecular_subtype(
 )
 paired = paired[paired['rna_barcode'].isin(rna_barcodes_set)].copy()
 print(f'Paired after filtered with tpm: {paired.shape}')
-paired.to_csv("subtyped_paired_metadata.csv", index=False)
+#paired.to_csv("subtyped_paired_metadata.csv", index=False)
 
 nonpaired = annotate_molecular_subtype(
     nonpaired_meta,
@@ -231,7 +231,7 @@ print(f'after selected nonpaired: {nonpaired.shape}')
 subtyped_full = pd.concat([paired, nonpaired]).reset_index(drop=True)
 
 # Export
-subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
+#subtyped_full.to_csv("subtyped_full_metadata.csv", index=False)
 print("✔ Exported: subtyped_full_metadata.csv")
 print(f'full: {subtyped_full.shape}')
 
@@ -251,7 +251,7 @@ print(available_barcodes.shape)
 gene_tpm = gene_tpm[available_barcodes]
 print(gene_tpm.shape)
 
-gene_tpm.to_csv("filtered_tpm.csv",index=False)
+#gene_tpm.to_csv("filtered_tpm.csv",index=False)
 print("✔ Exported: filtered_tpm.csv")
 
 
@@ -265,34 +265,36 @@ mask_mean = expr.mean(axis=1) >= 1
 
 expr_filtered = expr[mask_half & mask_mean]
 print(expr_filtered.shape)
-expr_filtered.to_csv("cleaned_tpm.csv")
+#expr_filtered.to_csv("cleaned_tpm.csv")
 print("✔ Exported: cleaned_tpm.csv")
 
 
 # ================================================================
 # Build relation matrix (for DM / OT)
 # ================================================================
+# Get sorted list of unique barcodes
 all_rna_barcodes = sorted(subtyped_full['rna_barcode'].unique())
 N = len(all_rna_barcodes)
 
-# Create index mapping
+# Map barcode → index
 barcode_to_index = {barcode: i for i, barcode in enumerate(all_rna_barcodes)}
 
-# Initialize adjacency matrix (NxN)
+# Initialize adjacency matrix
 relation_matrix_np = np.zeros((N, N), dtype=int)
 
-# Filter pairs to only include barcodes that are in subtyped_full
+# Filter pairs to valid barcodes
 valid_pairs = pairs[
     (pairs['tumor_barcode_a'].isin(all_rna_barcodes)) &
     (pairs['tumor_barcode_b'].isin(all_rna_barcodes))
 ]
 
+# Vectorized approach: get indices
+idx_a = valid_pairs['tumor_barcode_a'].map(barcode_to_index).to_numpy()
+idx_b = valid_pairs['tumor_barcode_b'].map(barcode_to_index).to_numpy()
+
 # Populate adjacency matrix
-for _, row in valid_pairs.iterrows():
-    idx_a = barcode_to_index[row['tumor_barcode_a']]
-    idx_b = barcode_to_index[row['tumor_barcode_b']]
-    relation_matrix_np[idx_a, idx_b] = 1
-    relation_matrix_np[idx_b, idx_a] = 1  # make symmetric
+relation_matrix_np[idx_a, idx_b] = 1
+relation_matrix_np[idx_b, idx_a] = 1  # ensure undirected
 
 # Convert to DataFrame
 adjacency_matrix = pd.DataFrame(
@@ -303,5 +305,6 @@ adjacency_matrix = pd.DataFrame(
 
 print(f"Adjacency matrix shape: {adjacency_matrix.shape}")
 
+# Export
 adjacency_matrix.to_csv("adjacency_matrix.csv")
 print("✔ Exported: adjacency_matrix.csv")
